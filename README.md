@@ -1,1 +1,101 @@
 # argo-shim
+
+A lightweight HTTP proxy that lets Claude Code talk to the ALCF Argo API through an SSH tunnel. It handles path rewriting (`/v1/messages` -> `/argoapi/v1/messages`), injects your API key, and bridges plain HTTP (what Claude Code speaks) to HTTPS (what the tunnel carries).
+
+## Prerequisites
+
+- SSH access to CELS machines ([setup guide](https://help.cels.anl.gov/docs/linux/ssh/))
+- Python 3.8+
+- Claude Code (`npm install -g @anthropic-ai/claude-code`)
+
+## Quick Start
+
+**1. Configure SSH (one-time)**
+
+Add to `~/.ssh/config` on the login node where you'll run Claude Code:
+
+```
+Host homes.cels.anl.gov
+    ProxyJump <username>@logins.cels.anl.gov
+    User <username>
+```
+
+**2. Run the shim**
+
+```bash
+python3 argo_shim.py
+```
+
+The shim will:
+- Find or create an SSH tunnel to `apps.inside.anl.gov:443`
+- Start a local HTTP proxy on the next available port (8081+)
+- Update `~/.claude/settings.json` with the correct `ANTHROPIC_BASE_URL`
+- Run health checks to verify connectivity
+
+> If your ALCF username differs from your CELS username, hardcode `API_KEY` at the top of the script.
+
+**3. Start Claude Code** (in another terminal on the same node)
+
+```bash
+claude
+```
+
+## Claude Code Settings
+
+The shim auto-updates `~/.claude/settings.json`, but for first-time setup you need:
+
+```json
+{
+  "apiKeyHelper": "echo <username>",
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8081/argoapi",
+    "CLAUDE_CODE_SKIP_ANTHROPIC_AUTH": "1"
+  }
+}
+```
+
+The shim will keep the port in `ANTHROPIC_BASE_URL` correct on subsequent runs.
+
+## Health Checks
+
+The shim runs these automatically on startup. To run them manually:
+
+```bash
+# Tunnel only (direct HTTPS through tunnel, use your tunnel port)
+curl -k -H "Host: apps.inside.anl.gov" \
+     -H "x-api-key: <username>" \
+     https://127.0.0.1:8080/argoapi/v1/models
+
+# Tunnel + shim end-to-end (use your shim port)
+curl http://127.0.0.1:8081/v1/models
+```
+
+## Troubleshooting
+
+**`[SSL: WRONG_VERSION_NUMBER]` proxy errors**
+
+The SSH tunnel is stale, usually caused by SSH ControlMaster keeping a dead connection open. Fix:
+
+```bash
+ssh -O exit homes.cels.anl.gov
+python3 argo_shim.py   # re-creates the tunnel
+```
+
+**`HEAD /argoapi HTTP/1.1 501`**
+
+You're running an older version of the shim that didn't handle HEAD requests. Update to the latest version.
+
+**Port already in use**
+
+The shim automatically scans ports 8080-8089 (tunnel) and 8081-8090 (shim). If all are taken, kill stale tunnels:
+
+```bash
+# List SSH tunnels
+ps aux | grep 'ssh -N'
+# Kill a specific one
+kill <pid>
+```
+
+**Claude Code can't connect after restarting the shim**
+
+The shim port may have changed. The shim updates `~/.claude/settings.json` automatically, but you need to restart Claude Code to pick up the new port.
