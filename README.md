@@ -22,7 +22,7 @@ The shim will:
 - Update `~/.claude/settings.json` with the correct `ANTHROPIC_BASE_URL`
 - Run health checks to verify connectivity
 
-> If your ALCF username differs from your CELS username, hardcode `API_KEY` at the top of the script.
+> If your ALCF username differs from your CELS username, set `CELS_USERNAME` to your CELS username
 
 **2. Start Claude Code** (in another terminal on the same node)
 
