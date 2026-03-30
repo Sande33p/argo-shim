@@ -3,6 +3,7 @@ import http.server
 import http.client
 import json
 import os
+import secrets
 import socket
 import socketserver
 import ssl
@@ -31,6 +32,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.handle_proxy("POST")
 
     def handle_proxy(self, method):
+        # Validate auth token
+        client_key = self.headers.get('x-api-key', '')
+        if client_key != self.server.auth_token:
+            self.send_response(401)
+            self.send_header('Content-Type', 'text/plain')
+            msg = b'Unauthorized: invalid or missing x-api-key'
+            self.send_header('Content-Length', str(len(msg)))
+            self.end_headers()
+            self.wfile.write(msg)
+            print(f"[{method}] Rejected request (bad token)")
+            return
+
         body = None
         if method == "POST":
             try:
@@ -93,8 +106,9 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, server_address, handler, target_port):
+    def __init__(self, server_address, handler, target_port, auth_token):
         self.target_port = target_port
+        self.auth_token = auth_token
         super().__init__(server_address, handler)
 
 
@@ -207,8 +221,8 @@ def create_tunnel(base, host="127.0.0.1"):
     return port
 
 
-def update_claude_settings(listen_port):
-    """Update ~/.claude/settings.json with the correct ANTHROPIC_BASE_URL."""
+def update_claude_settings(listen_port, auth_token):
+    """Update ~/.claude/settings.json with the correct ANTHROPIC_BASE_URL and auth token."""
     settings_path = os.path.expanduser("~/.claude/settings.json")
     os.makedirs(os.path.dirname(settings_path), exist_ok=True)
     try:
@@ -216,7 +230,6 @@ def update_claude_settings(listen_port):
             settings = json.load(f)
     except FileNotFoundError:
         settings = {
-            "apiKeyHelper": f"echo {API_KEY}",
             "env": {
                 "CLAUDE_CODE_SKIP_ANTHROPIC_AUTH": "1"
             }
@@ -227,21 +240,17 @@ def update_claude_settings(listen_port):
         return False
 
     new_url = f"http://127.0.0.1:{listen_port}/argoapi"
-    old_url = settings.get("env", {}).get("ANTHROPIC_BASE_URL", "")
-
-    if old_url == new_url:
-        print(f"  ✓ settings.json already has correct port {listen_port}")
-        return True
-
+    settings["apiKeyHelper"] = f"echo {auth_token}"
     settings.setdefault("env", {})["ANTHROPIC_BASE_URL"] = new_url
+
     with open(settings_path, "w") as f:
         json.dump(settings, f, indent=2)
         f.write("\n")
-    print(f"  ✓ Updated ANTHROPIC_BASE_URL: {old_url} -> {new_url}")
+    print(f"  ✓ Updated settings.json (port={listen_port}, token rotated)")
     return True
 
 
-def health_check(tunnel_port, listen_port):
+def health_check(tunnel_port, listen_port, auth_token):
     """Validate the full chain: tunnel -> remote endpoint, and shim -> tunnel."""
     print("\nRunning health checks...")
     ok = True
@@ -273,7 +282,7 @@ def health_check(tunnel_port, listen_port):
     print(f"  [2/2] Shim (127.0.0.1:{listen_port} -> tunnel:{tunnel_port})...")
     try:
         conn = http.client.HTTPConnection(TARGET_HOST, listen_port, timeout=10)
-        conn.request("GET", "/v1/models")
+        conn.request("GET", "/v1/models", headers={"x-api-key": auth_token})
         resp = conn.getresponse()
         body = resp.read()
         conn.close()
@@ -307,16 +316,17 @@ if __name__ == "__main__":
 
     # 3. Start the shim
     listen_port = find_free_port(max(BASE_LISTEN_PORT, tunnel_port + 1))
+    auth_token = secrets.token_urlsafe(32)
 
-    # 4. Update Claude settings with the correct port
-    update_claude_settings(listen_port)
+    # 4. Update Claude settings with the correct port and token
+    update_claude_settings(listen_port, auth_token)
     print(f"Set ANTHROPIC_BASE_URL=http://127.0.0.1:{listen_port}/argoapi")
 
-    with ThreadedTCPServer(("127.0.0.1", listen_port), ProxyHandler, tunnel_port) as httpd:
+    with ThreadedTCPServer(("127.0.0.1", listen_port), ProxyHandler, tunnel_port, auth_token) as httpd:
         print(f"✅ Shim running on {listen_port} -> {tunnel_port}. Supports GET/POST/HEAD.")
 
         # 5. Run health checks in background after shim is listening
         import threading
-        threading.Thread(target=health_check, args=(tunnel_port, listen_port), daemon=True).start()
+        threading.Thread(target=health_check, args=(tunnel_port, listen_port, auth_token), daemon=True).start()
 
         httpd.serve_forever()
