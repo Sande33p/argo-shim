@@ -184,11 +184,20 @@ def create_tunnel(base, host="127.0.0.1"):
 def update_claude_settings(listen_port):
     """Update ~/.claude/settings.json with the correct ANTHROPIC_BASE_URL."""
     settings_path = os.path.expanduser("~/.claude/settings.json")
+    os.makedirs(os.path.dirname(settings_path), exist_ok=True)
     try:
         with open(settings_path, "r") as f:
             settings = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        print(f"  ⚠ Could not read {settings_path}: {e}")
+    except FileNotFoundError:
+        settings = {
+            "apiKeyHelper": f"echo {API_KEY}",
+            "env": {
+                "CLAUDE_CODE_SKIP_ANTHROPIC_AUTH": "1"
+            }
+        }
+        print(f"  Creating new {settings_path}")
+    except json.JSONDecodeError as e:
+        print(f"  ⚠ Could not parse {settings_path}: {e}")
         return False
 
     new_url = f"http://127.0.0.1:{listen_port}/argoapi"
