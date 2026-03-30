@@ -15,7 +15,7 @@ BASE_LISTEN_PORT = 8081
 MAX_PORT_RETRIES = 10
 TARGET_HOST = "127.0.0.1"
 REAL_HOST = "apps.inside.anl.gov"
-API_KEY = getpass.getuser()
+API_KEY = os.environ.get("CELS_USERNAME", getpass.getuser())
 SSH_JUMP_HOST = "homes.cels.anl.gov"
 SSH_PROXY_JUMP = "logins.cels.anl.gov"
 
