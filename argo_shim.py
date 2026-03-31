@@ -26,7 +26,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.handle_proxy("GET")
 
     def do_HEAD(self):
-        self.handle_proxy("HEAD")
+        # Claude Code sends HEAD to the base URL as a connectivity probe.
+        # Reply directly instead of proxying to avoid a 404 from upstream.
+        self.send_response(200)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
 
     def do_POST(self):
         self.handle_proxy("POST")
