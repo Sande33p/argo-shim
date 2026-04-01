@@ -1,5 +1,6 @@
 import argparse
 import getpass
+import hashlib
 import http.server
 import http.client
 import json
@@ -13,12 +14,16 @@ import subprocess
 import threading
 import time
 
-BASE_TUNNEL_PORT = 8080
-BASE_LISTEN_PORT = 8081
-MAX_PORT_RETRIES = 10
 TARGET_HOST = "127.0.0.1"
 REAL_HOST = "apps.inside.anl.gov"
 API_KEY = os.environ.get("CELS_USERNAME", getpass.getuser())
+
+
+def default_port(username):
+    """Derive a deterministic listen port from the username."""
+    h = hashlib.sha256(username.encode()).hexdigest()
+    return 10000 + (int(h[:8], 16) % 22768)  # range 10000-32767 (below ephemeral range)
+
 SSH_JUMP_HOST = "homes.cels.anl.gov"
 SSH_PROXY_JUMP = "logins.cels.anl.gov"
 
@@ -136,16 +141,16 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         super().__init__(server_address, handler)
 
 
-def find_free_port(base, host="127.0.0.1"):
-    """Find a port that nothing is bound to (for the shim to listen on)."""
-    for port in range(base, base + MAX_PORT_RETRIES):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.bind((host, port))
-                return port
-            except OSError:
-                print(f"Port {port} in use, trying next...")
-    raise RuntimeError(f"No free port found in range {base}-{base + MAX_PORT_RETRIES - 1}")
+def check_port_available(port, host="127.0.0.1"):
+    """Check that a port is available, or raise with a helpful message."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, port))
+        except OSError:
+            raise RuntimeError(
+                f"Port {port} is already in use. "
+                f"Use --port <PORT> to specify a different port."
+            )
 
 
 def verify_tunnel(port, host="127.0.0.1"):
@@ -197,28 +202,26 @@ def is_own_process(port):
     return False
 
 
-def find_existing_tunnel(base, host="127.0.0.1"):
-    """Check if a verified tunnel to REAL_HOST already exists in the port range."""
-    for port in range(base, base + MAX_PORT_RETRIES):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(1)
-            try:
-                s.connect((host, port))
-                if not is_own_process(port):
-                    continue
-                print(f"Port {port} is listening, verifying tunnel...")
-                if verify_tunnel(port, host):
-                    return port
-                else:
-                    print(f"  Skipping port {port} (not a valid tunnel to {REAL_HOST})")
-            except (ConnectionRefusedError, OSError):
-                pass
-    return None
+def find_existing_tunnel(port, host="127.0.0.1"):
+    """Check if a verified tunnel to REAL_HOST already exists on this port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        try:
+            s.connect((host, port))
+        except (ConnectionRefusedError, OSError):
+            return False
+    if not is_own_process(port):
+        return False
+    print(f"Port {port} is listening, verifying tunnel...")
+    if verify_tunnel(port, host):
+        return True
+    print(f"  Port {port} is not a valid tunnel to {REAL_HOST}")
+    return False
 
 
-def create_tunnel(base, host="127.0.0.1"):
-    """Create a new SSH tunnel and verify it's working."""
-    port = find_free_port(base)
+def create_tunnel(port, host="127.0.0.1"):
+    """Create a new SSH tunnel on the given port and verify it's working."""
+    check_port_available(port, host)
     cmd = ["ssh", "-N", "-f", "-J", f"{API_KEY}@{SSH_PROXY_JUMP}", "-L", f"{port}:{REAL_HOST}:443", f"{API_KEY}@{SSH_JUMP_HOST}"]
     print(f"Creating SSH tunnel on port {port}...")
     print(f"  $ {' '.join(cmd)}")
@@ -336,21 +339,29 @@ if __name__ == "__main__":
     parser.add_argument("--no-auth", action="store_true",
                         help="Disable token authentication on the shim (useful when project-level "
                              "Claude settings override the global apiKeyHelper)")
+    parser.add_argument("--port", type=int, default=None,
+                        help="Listen port for the shim (default: derived from username)")
     args = parser.parse_args()
 
     print(f"API key: {API_KEY}")
 
+    if args.port:
+        listen_port = args.port
+    else:
+        listen_port = default_port(API_KEY)
+        print(f"Derived port {listen_port} from username (override with --port <PORT>)")
+    tunnel_port = listen_port - 1
+
     # 1. Look for an existing verified tunnel
-    tunnel_port = find_existing_tunnel(BASE_TUNNEL_PORT)
-    if tunnel_port:
+    if find_existing_tunnel(tunnel_port):
         print(f"Using existing tunnel on port {tunnel_port}")
     else:
         # 2. No valid tunnel found — create one
-        tunnel_port = create_tunnel(BASE_TUNNEL_PORT)
+        create_tunnel(tunnel_port)
         print(f"Tunnel created on port {tunnel_port}")
 
     # 3. Start the shim
-    listen_port = find_free_port(max(BASE_LISTEN_PORT, tunnel_port + 1))
+    check_port_available(listen_port)
     auth_token = None if args.no_auth else secrets.token_urlsafe(32)
 
     if args.no_auth:

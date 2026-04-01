@@ -18,9 +18,17 @@ python3 argo_shim.py
 
 The shim will:
 - Find or create an SSH tunnel to `apps.inside.anl.gov:443`
-- Start a local HTTP proxy on the next available port (8081+)
+- Start a local HTTP proxy on a port derived from your username (deterministic across restarts)
 - Generate a per-session auth token and update `~/.claude/settings.json` with the correct `ANTHROPIC_BASE_URL` and `apiKeyHelper`
 - Run health checks to verify connectivity
+
+To use a specific port instead of the auto-derived one:
+
+```bash
+python3 argo_shim.py --port 8083
+```
+
+The tunnel will use the port immediately below (e.g., `--port 8083` → tunnel on 8082, shim on 8083).
 
 > If your ALCF username differs from your CELS username, set `CELS_USERNAME` to your CELS username
 
@@ -49,13 +57,13 @@ Without this, Claude Code defaults to Sonnet.
 The shim runs these automatically on startup. To run them manually:
 
 ```bash
-# Tunnel only (direct HTTPS through tunnel, use your tunnel port)
+# Tunnel only (direct HTTPS through tunnel; use your tunnel port from startup logs)
 curl -k -H "Host: apps.inside.anl.gov" \
      -H "x-api-key: <username>" \
-     https://127.0.0.1:8080/argoapi/v1/models
+     https://127.0.0.1:<tunnel-port>/argoapi/v1/models
 
 # Tunnel + shim end-to-end (use your shim port; token is printed at startup)
-curl -H "x-api-key: <auth-token>" http://127.0.0.1:8081/v1/models
+curl -H "x-api-key: <auth-token>" http://127.0.0.1:<shim-port>/v1/models
 ```
 
 ## Troubleshooting
@@ -75,7 +83,13 @@ You're running an older version of the shim that didn't handle HEAD requests. Up
 
 **Port already in use**
 
-The shim automatically scans ports 8080-8089 (tunnel) and 8081-8090 (shim). If all are taken, kill stale tunnels:
+The shim derives a deterministic port from your username. If that port is taken, specify a different one:
+
+```bash
+python3 argo_shim.py --port 8083
+```
+
+To find and kill stale SSH tunnels occupying ports:
 
 ```bash
 # List SSH tunnels
@@ -84,9 +98,11 @@ ps aux | grep 'ssh -N'
 kill <pid>
 ```
 
-**Claude Code can't connect after restarting the shim**
+**Claude Code can't connect / API connection refused**
 
-The shim port may have changed. The shim updates `~/.claude/settings.json` automatically, but you need to restart Claude Code to pick up the new port.
+A few things to check:
+- **Restart Claude Code** after restarting the shim — Claude Code only reads `~/.claude/settings.json` at startup, so it won't pick up a new port or token until restarted.
+- **Try a different port** — in rare cases the derived port may not work on your node. Use `--port <PORT>` to specify an alternative (e.g., `python3 argo_shim.py --port 8083`).
 
 **401 errors / auth failures with project-level Claude settings**
 
