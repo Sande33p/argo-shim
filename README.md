@@ -19,7 +19,7 @@ python3 argo_shim.py
 The shim will:
 - Find or create an SSH tunnel to `apps.inside.anl.gov:443`
 - Start a local HTTP proxy on the next available port (8081+)
-- Update `~/.claude/settings.json` with the correct `ANTHROPIC_BASE_URL`
+- Generate a per-session auth token and update `~/.claude/settings.json` with the correct `ANTHROPIC_BASE_URL` and `apiKeyHelper`
 - Run health checks to verify connectivity
 
 > If your ALCF username differs from your CELS username, set `CELS_USERNAME` to your CELS username
@@ -54,8 +54,8 @@ curl -k -H "Host: apps.inside.anl.gov" \
      -H "x-api-key: <username>" \
      https://127.0.0.1:8080/argoapi/v1/models
 
-# Tunnel + shim end-to-end (use your shim port)
-curl http://127.0.0.1:8081/v1/models
+# Tunnel + shim end-to-end (use your shim port; token is printed at startup)
+curl -H "x-api-key: <auth-token>" http://127.0.0.1:8081/v1/models
 ```
 
 ## Troubleshooting
@@ -87,6 +87,18 @@ kill <pid>
 **Claude Code can't connect after restarting the shim**
 
 The shim port may have changed. The shim updates `~/.claude/settings.json` automatically, but you need to restart Claude Code to pick up the new port.
+
+**401 errors / auth failures with project-level Claude settings**
+
+The shim writes `apiKeyHelper` and `ANTHROPIC_BASE_URL` to `~/.claude/settings.json` (global). If you have a project-level `.claude/settings.json` with its own `env` object, it **overrides** the global `env` entirely (Claude Code does not merge object/scalar settings across scopes — only arrays merge). This means the shim's auth token never reaches Claude Code.
+
+Fix: run the shim with `--no-auth` to disable token authentication:
+
+```bash
+python3 argo_shim.py --no-auth
+```
+
+This is safe because the shim only listens on `127.0.0.1`. You will still need `ANTHROPIC_BASE_URL` set correctly — either in your global settings (where the shim writes it) or in your project settings.
 
 **`500: Streaming is required for operations that may take longer than 10 minutes`**
 

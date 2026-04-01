@@ -1,3 +1,4 @@
+import argparse
 import getpass
 import http.server
 import http.client
@@ -39,16 +40,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def handle_proxy(self, method):
         # Validate auth token (HEAD is exempt — used by Claude Code as a connectivity probe)
-        client_key = self.headers.get('x-api-key', '')
-        if method != "HEAD" and client_key != self.server.auth_token:
-            self.send_response(401)
-            self.send_header('Content-Type', 'text/plain')
-            msg = b'Unauthorized: invalid or missing x-api-key'
-            self.send_header('Content-Length', str(len(msg)))
-            self.end_headers()
-            self.wfile.write(msg)
-            print(f"[{method}] Rejected request (bad token)")
-            return
+        if self.server.auth_token:
+            client_key = self.headers.get('x-api-key', '')
+            if method != "HEAD" and client_key != self.server.auth_token:
+                self.send_response(401)
+                self.send_header('Content-Type', 'text/plain')
+                msg = b'Unauthorized: invalid or missing x-api-key'
+                self.send_header('Content-Length', str(len(msg)))
+                self.end_headers()
+                self.wfile.write(msg)
+                print(f"[{method}] Rejected request (bad token)")
+                return
 
         body = None
         if method == "POST":
@@ -262,13 +264,17 @@ def update_claude_settings(listen_port, auth_token):
         return False
 
     new_url = f"http://127.0.0.1:{listen_port}/argoapi"
-    settings["apiKeyHelper"] = f"echo {auth_token}"
+    if auth_token:
+        settings["apiKeyHelper"] = f"echo {auth_token}"
+    else:
+        settings["apiKeyHelper"] = "echo no-auth"
     settings.setdefault("env", {})["ANTHROPIC_BASE_URL"] = new_url
 
     with open(settings_path, "w") as f:
         json.dump(settings, f, indent=2)
         f.write("\n")
-    print(f"  ✓ Updated settings.json (port={listen_port}, token rotated)")
+    auth_status = "token rotated" if auth_token else "no auth"
+    print(f"  ✓ Updated settings.json (port={listen_port}, {auth_status})")
     return True
 
 
@@ -304,7 +310,8 @@ def health_check(tunnel_port, listen_port, auth_token):
     print(f"  [2/2] Shim (127.0.0.1:{listen_port} -> tunnel:{tunnel_port})...")
     try:
         conn = http.client.HTTPConnection(TARGET_HOST, listen_port, timeout=10)
-        conn.request("GET", "/v1/models", headers={"x-api-key": auth_token})
+        headers = {"x-api-key": auth_token} if auth_token else {}
+        conn.request("GET", "/v1/models", headers=headers)
         resp = conn.getresponse()
         body = resp.read()
         conn.close()
@@ -325,6 +332,12 @@ def health_check(tunnel_port, listen_port, auth_token):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="HTTP proxy shim for Argo API via SSH tunnel")
+    parser.add_argument("--no-auth", action="store_true",
+                        help="Disable token authentication on the shim (useful when project-level "
+                             "Claude settings override the global apiKeyHelper)")
+    args = parser.parse_args()
+
     print(f"API key: {API_KEY}")
 
     # 1. Look for an existing verified tunnel
@@ -338,7 +351,10 @@ if __name__ == "__main__":
 
     # 3. Start the shim
     listen_port = find_free_port(max(BASE_LISTEN_PORT, tunnel_port + 1))
-    auth_token = secrets.token_urlsafe(32)
+    auth_token = None if args.no_auth else secrets.token_urlsafe(32)
+
+    if args.no_auth:
+        print("⚠ Auth disabled (--no-auth): shim accepts unauthenticated requests on localhost")
 
     # 4. Update Claude settings with the correct port and token
     update_claude_settings(listen_port, auth_token)
