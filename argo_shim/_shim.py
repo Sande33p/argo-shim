@@ -122,7 +122,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     conn = http.client.HTTPSConnection(self.server.target_host, self.server.target_port, context=context, timeout=300)
                     continue
                 print(f"[{method}] Upstream connection refused (tunnel is down)")
-                self._send_error(502, "Bad Gateway: SSH tunnel is down. Restart argo_shim.")
+                self._send_error(502, "Bad Gateway: SSH tunnel is down. Restart argo-shim.")
                 return
             except Exception as e:
                 conn.close()
@@ -166,15 +166,20 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, server_address, handler, target_host, target_port, auth_token):
+    def __init__(self, server_address, handler, target_host, target_port, auth_token, tunnel_is_remote=False):
         self.target_host = target_host
         self.target_port = target_port
         self.auth_token = auth_token
+        self.tunnel_is_remote = tunnel_is_remote
         self._tunnel_lock = threading.Lock()
         super().__init__(server_address, handler)
 
     def recover_tunnel(self):
         """Attempt to recreate the SSH tunnel. Returns True if recovery succeeded."""
+        if self.tunnel_is_remote:
+            # Remote tunnel (--tunnel-host / --relay): can't recreate from here
+            print("Tunnel is remote — cannot recover locally. Check the relay or UAN.")
+            return False
         with self._tunnel_lock:
             # Re-check under lock — another thread may have already recovered
             if find_existing_tunnel(self.target_port):
@@ -226,11 +231,11 @@ def verify_tunnel(port, host="127.0.0.1"):
         return False
 
 
-def is_own_process(port):
+def is_own_process(port, host="127.0.0.1"):
     """Check if the process listening on a port belongs to the current user."""
     try:
         result = subprocess.run(
-            ["lsof", "-ti", f"TCP@127.0.0.1:{port}", "-sTCP:LISTEN"],
+            ["lsof", "-ti", f"TCP@{host}:{port}", "-sTCP:LISTEN"],
             capture_output=True, text=True, timeout=5
         )
         for pid in result.stdout.strip().split('\n'):
@@ -258,7 +263,7 @@ def find_existing_tunnel(port, host="127.0.0.1"):
             s.connect((host, port))
         except (ConnectionRefusedError, OSError):
             return False
-    if not is_own_process(port):
+    if not is_own_process(port, host):
         return False
     print(f"Port {port} is listening, verifying tunnel...")
     if verify_tunnel(port, host):
@@ -436,7 +441,7 @@ def main():
     if args.tunnel:
         # Tunnel-only mode: create a 0.0.0.0-bound tunnel on the UAN and exit
         hostname = socket.gethostname()
-        if find_existing_tunnel(tunnel_port):
+        if find_existing_tunnel(tunnel_port, "0.0.0.0") or find_existing_tunnel(tunnel_port):
             print(f"Tunnel already running on port {tunnel_port}")
         else:
             create_tunnel(tunnel_port, bind_address="0.0.0.0")
@@ -498,7 +503,8 @@ def main():
         update_claude_settings(listen_port, auth_token)
         print(f"Set ANTHROPIC_BASE_URL=http://127.0.0.1:{listen_port}/argoapi")
 
-    with ThreadedTCPServer(("127.0.0.1", listen_port), ProxyHandler, tunnel_host, tunnel_port, auth_token) as httpd:
+    tunnel_is_remote = bool(args.tunnel_host or args.relay)
+    with ThreadedTCPServer(("127.0.0.1", listen_port), ProxyHandler, tunnel_host, tunnel_port, auth_token, tunnel_is_remote) as httpd:
         print(f"✅ Shim running on {listen_port} -> {tunnel_port}. Supports GET/POST/HEAD.")
 
         def shutdown_handler(signum, frame):
