@@ -50,6 +50,32 @@ The tunnel will use the port immediately below (e.g., `--port 8083` → tunnel o
 claude
 ```
 
+## Running from Compute Nodes
+
+Compute nodes don't have outbound network access, so they can't create SSH tunnels directly. Instead, create the tunnel on a UAN and point the shim at it.
+
+**1. On a UAN** — create a tunnel bound to all interfaces:
+
+```bash
+ssh -N -f -J $USER@logins.cels.anl.gov -L 0.0.0.0:25939:apps.inside.anl.gov:443 $USER@homes.cels.anl.gov
+```
+
+(Replace `25939` with your tunnel port — it's `listen_port - 1`, where `listen_port` is what `argo-shim` prints as "Derived port".)
+
+**2. On the compute node** — run the shim with `--tunnel-host`:
+
+```bash
+argo-shim --tunnel-host <uan-hostname>
+```
+
+For example, if your tunnel is on `aurora-uan-0009`:
+
+```bash
+argo-shim --tunnel-host aurora-uan-0009
+```
+
+The shim skips tunnel creation and proxies through the UAN's tunnel instead.
+
 ## Claude Code Settings
 
 The shim automatically creates `~/.claude/settings.json` on first run and keeps the port in `ANTHROPIC_BASE_URL` correct on subsequent runs. No manual setup needed.
@@ -136,7 +162,16 @@ The shim works around this by forcing `stream: true` on all POST requests to `/m
 
 **"ERROR: The requested URL could not be retrieved" in Claude Code**
 
-If you see the above in Claude Code after sending a prompt, you may need to unset some HTTP proxies in your .bashrc.
+HPC login nodes often set `HTTP_PROXY` / `HTTPS_PROXY` environment variables that route traffic through an institutional proxy, bypassing the shim's localhost proxy entirely. Clear them when launching Claude Code:
 
-Please use these proxy settings to prevent setting proxies on login nodes.
-https://docs.alcf.anl.gov/aurora/getting-started-on-aurora/#proxy
+```bash
+HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= claude
+```
+
+To make this permanent, unset the proxy vars in your shell config (e.g., `~/.bashrc`):
+
+```bash
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+```
+
+See the [ALCF proxy docs](https://docs.alcf.anl.gov/aurora/getting-started-on-aurora/#proxy) for more details on proxy settings on Aurora login nodes.

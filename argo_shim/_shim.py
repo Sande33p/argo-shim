@@ -102,7 +102,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             path = ("/argoapi/" + path.lstrip("/")).replace("//", "/")
 
         context = ssl._create_unverified_context()
-        conn = http.client.HTTPSConnection(TARGET_HOST, self.server.target_port, context=context, timeout=300)
+        conn = http.client.HTTPSConnection(self.server.target_host, self.server.target_port, context=context, timeout=300)
 
         # Build headers
         headers = {k: v for k, v in self.headers.items() if k.lower() not in ['host', 'content-length', 'authorization']}
@@ -166,7 +166,8 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, server_address, handler, target_port, auth_token):
+    def __init__(self, server_address, handler, target_host, target_port, auth_token):
+        self.target_host = target_host
         self.target_port = target_port
         self.auth_token = auth_token
         self._tunnel_lock = threading.Lock()
@@ -335,16 +336,16 @@ def update_claude_settings(listen_port, auth_token):
     return True
 
 
-def health_check(tunnel_port, listen_port, auth_token):
+def health_check(tunnel_host, tunnel_port, listen_port, auth_token):
     """Validate the full chain: tunnel -> remote endpoint, and shim -> tunnel."""
     print("\nRunning health checks...")
     ok = True
 
     # 1. Tunnel health: TLS + HTTP request to the real endpoint
-    print(f"  [1/2] Tunnel (127.0.0.1:{tunnel_port} -> {REAL_HOST})...")
+    print(f"  [1/2] Tunnel ({tunnel_host}:{tunnel_port} -> {REAL_HOST})...")
     try:
         context = ssl._create_unverified_context()
-        conn = http.client.HTTPSConnection(TARGET_HOST, tunnel_port, context=context, timeout=10)
+        conn = http.client.HTTPSConnection(tunnel_host, tunnel_port, context=context, timeout=10)
         conn.request("GET", "/argoapi/v1/models", headers={"Host": REAL_HOST, "x-api-key": API_KEY})
         resp = conn.getresponse()
         body = resp.read()
@@ -395,6 +396,11 @@ def main():
                              "Claude settings override the global apiKeyHelper)")
     parser.add_argument("--port", type=int, default=None,
                         help="Listen port for the shim (default: derived from username)")
+    parser.add_argument("--tunnel-host", default=None,
+                        help="Connect to an existing tunnel on a remote host (e.g., a UAN hostname). "
+                             "Skips local tunnel creation. Use when running from compute nodes.")
+    parser.add_argument("--no-update-settings", action="store_true",
+                        help="Don't modify ~/.claude/settings.json (useful if you manage settings separately)")
     args = parser.parse_args()
 
     print(f"API key: {API_KEY}")
@@ -405,12 +411,22 @@ def main():
         listen_port = default_port(API_KEY)
         print(f"Derived port {listen_port} from username (override with --port <PORT>)")
     tunnel_port = listen_port - 1
+    tunnel_host = args.tunnel_host or "127.0.0.1"
 
-    # 1. Look for an existing verified tunnel
-    if find_existing_tunnel(tunnel_port):
+    if args.tunnel_host:
+        # Compute node mode: use pre-existing tunnel on remote host
+        print(f"Using remote tunnel at {tunnel_host}:{tunnel_port}")
+        if not verify_tunnel(tunnel_port, tunnel_host):
+            raise RuntimeError(
+                f"No valid tunnel found at {tunnel_host}:{tunnel_port}. "
+                f"Start one on the UAN first:\n"
+                f"  ssh -N -f -J {API_KEY}@{SSH_PROXY_JUMP} "
+                f"-L 0.0.0.0:{tunnel_port}:{REAL_HOST}:443 "
+                f"{API_KEY}@{SSH_JUMP_HOST}"
+            )
+    elif find_existing_tunnel(tunnel_port):
         print(f"Using existing tunnel on port {tunnel_port}")
     else:
-        # 2. No valid tunnel found — create one
         create_tunnel(tunnel_port)
         print(f"Tunnel created on port {tunnel_port}")
 
@@ -422,10 +438,11 @@ def main():
         print("⚠ Auth disabled (--no-auth): shim accepts unauthenticated requests on localhost")
 
     # 4. Update Claude settings with the correct port and token
-    update_claude_settings(listen_port, auth_token)
-    print(f"Set ANTHROPIC_BASE_URL=http://127.0.0.1:{listen_port}/argoapi")
+    if not args.no_update_settings:
+        update_claude_settings(listen_port, auth_token)
+        print(f"Set ANTHROPIC_BASE_URL=http://127.0.0.1:{listen_port}/argoapi")
 
-    with ThreadedTCPServer(("127.0.0.1", listen_port), ProxyHandler, tunnel_port, auth_token) as httpd:
+    with ThreadedTCPServer(("127.0.0.1", listen_port), ProxyHandler, tunnel_host, tunnel_port, auth_token) as httpd:
         print(f"✅ Shim running on {listen_port} -> {tunnel_port}. Supports GET/POST/HEAD.")
 
         def shutdown_handler(signum, frame):
@@ -437,7 +454,7 @@ def main():
         signal.signal(signal.SIGTERM, shutdown_handler)
 
         # 5. Run health checks in background after shim is listening
-        threading.Thread(target=health_check, args=(tunnel_port, listen_port, auth_token), daemon=True).start()
+        threading.Thread(target=health_check, args=(tunnel_host, tunnel_port, listen_port, auth_token), daemon=True).start()
 
         httpd.serve_forever()
         print("Shim stopped.")
