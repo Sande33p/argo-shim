@@ -231,11 +231,13 @@ def verify_tunnel(port, host="127.0.0.1"):
         return False
 
 
-def is_own_process(port, host="127.0.0.1"):
+def is_own_process(port):
     """Check if the process listening on a port belongs to the current user."""
     try:
+        # Use TCP:{port} without address filter — lsof represents 0.0.0.0 as *
+        # so TCP@127.0.0.1 and TCP@0.0.0.0 both fail to match wildcard binds.
         result = subprocess.run(
-            ["lsof", "-ti", f"TCP@{host}:{port}", "-sTCP:LISTEN"],
+            ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
             capture_output=True, text=True, timeout=5
         )
         for pid in result.stdout.strip().split('\n'):
@@ -263,7 +265,7 @@ def find_existing_tunnel(port, host="127.0.0.1"):
             s.connect((host, port))
         except (ConnectionRefusedError, OSError):
             return False
-    if not is_own_process(port, host):
+    if not is_own_process(port):
         return False
     print(f"Port {port} is listening, verifying tunnel...")
     if verify_tunnel(port, host):
@@ -428,6 +430,10 @@ def main():
                         help="Don't modify ~/.claude/settings.json (useful if you manage settings separately)")
     args = parser.parse_args()
 
+    mode_flags = sum(bool(x) for x in [args.tunnel, args.tunnel_host, args.relay])
+    if mode_flags > 1:
+        parser.error("--tunnel, --tunnel-host, and --relay are mutually exclusive")
+
     print(f"API key: {API_KEY}")
 
     if args.port:
@@ -503,7 +509,7 @@ def main():
         update_claude_settings(listen_port, auth_token)
         print(f"Set ANTHROPIC_BASE_URL=http://127.0.0.1:{listen_port}/argoapi")
 
-    tunnel_is_remote = bool(args.tunnel_host or args.relay)
+    tunnel_is_remote = bool(args.tunnel_host)
     with ThreadedTCPServer(("127.0.0.1", listen_port), ProxyHandler, tunnel_host, tunnel_port, auth_token, tunnel_is_remote) as httpd:
         print(f"✅ Shim running on {listen_port} -> {tunnel_port}. Supports GET/POST/HEAD.")
 
