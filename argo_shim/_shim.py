@@ -303,6 +303,16 @@ def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
     return port
 
 
+def create_reverse_tunnel(remote_host, port):
+    """Create a reverse SSH tunnel, forwarding remote_host:port to localhost:port."""
+    cmd = ["ssh", "-N", "-f", "-R", f"0.0.0.0:{port}:127.0.0.1:{port}", remote_host]
+    print(f"Creating reverse tunnel to {remote_host}:{port}...")
+    print(f"  $ {' '.join(cmd)}")
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        raise RuntimeError(f"Reverse SSH tunnel to {remote_host} failed (exit code {result.returncode})")
+
+
 def update_claude_settings(listen_port, auth_token):
     """Update ~/.claude/settings.json with the correct ANTHROPIC_BASE_URL and auth token."""
     settings_path = os.path.expanduser("~/.claude/settings.json")
@@ -401,10 +411,14 @@ def main():
                         help="Listen port for the shim (default: derived from username)")
     parser.add_argument("--tunnel", action="store_true",
                         help="Create an SSH tunnel bound to 0.0.0.0 (for compute node access) and exit. "
-                             "Run this on a UAN before using --tunnel-host on a compute node.")
+                             "Requires SSH access to CELS. Run on a UAN, or use --relay from your Mac.")
     parser.add_argument("--tunnel-host", default=None,
                         help="Connect to an existing tunnel on a remote host (e.g., a UAN hostname). "
                              "Skips local tunnel creation. Use when running from compute nodes.")
+    parser.add_argument("--relay", metavar="REMOTE_HOST", default=None,
+                        help="Relay mode: create SSH tunnel locally, then reverse-forward it to "
+                             "REMOTE_HOST (e.g., a UAN). Run this on your Mac so compute nodes "
+                             "can reach the API via the UAN.")
     parser.add_argument("--no-update-settings", action="store_true",
                         help="Don't modify ~/.claude/settings.json (useful if you manage settings separately)")
     args = parser.parse_args()
@@ -431,17 +445,41 @@ def main():
         print(f"  argo-shim --tunnel-host {hostname}")
         return
 
+    if args.relay:
+        # Relay mode: create local tunnel, then reverse-forward to remote host
+        if find_existing_tunnel(tunnel_port):
+            print(f"Using existing tunnel on port {tunnel_port}")
+        else:
+            create_tunnel(tunnel_port)
+            print(f"Tunnel created on port {tunnel_port}")
+        create_reverse_tunnel(args.relay, tunnel_port)
+        print(f"\nRelay active: {args.relay}:{tunnel_port} -> localhost:{tunnel_port}")
+        print(f"\nOn the compute node, run:")
+        print(f"  argo-shim --tunnel-host {args.relay}")
+        # Continue to start the local shim so Mac can also use Claude
+
     if args.tunnel_host:
         # Compute node mode: use pre-existing tunnel on remote host
         print(f"Using remote tunnel at {tunnel_host}:{tunnel_port}")
         if not verify_tunnel(tunnel_port, tunnel_host):
-            raise RuntimeError(
-                f"No valid tunnel found at {tunnel_host}:{tunnel_port}. "
-                f"Start one on the UAN first:\n"
-                f"  ssh -N -f -J {API_KEY}@{SSH_PROXY_JUMP} "
-                f"-L 0.0.0.0:{tunnel_port}:{REAL_HOST}:443 "
-                f"{API_KEY}@{SSH_JUMP_HOST}"
-            )
+            # Direct connection failed (likely GatewayPorts disabled).
+            # Try SSH local forward to reach the remote host's localhost port.
+            print(f"  Direct connection failed, creating SSH forward to {tunnel_host}...")
+            fwd_cmd = ["ssh", "-N", "-f", "-L",
+                       f"127.0.0.1:{tunnel_port}:127.0.0.1:{tunnel_port}", tunnel_host]
+            print(f"  $ {' '.join(fwd_cmd)}")
+            result = subprocess.run(fwd_cmd)
+            if result.returncode != 0:
+                raise RuntimeError(f"SSH forward to {tunnel_host} failed (exit code {result.returncode})")
+            tunnel_host = "127.0.0.1"
+            if not verify_tunnel(tunnel_port, tunnel_host):
+                raise RuntimeError(
+                    f"No valid tunnel found at {args.tunnel_host}:{tunnel_port} "
+                    f"(tried direct and SSH forward). "
+                    f"Ensure --relay is running on your Mac."
+                )
+    elif args.relay:
+        pass  # tunnel already created above
     elif find_existing_tunnel(tunnel_port):
         print(f"Using existing tunnel on port {tunnel_port}")
     else:
