@@ -102,7 +102,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             path = ("/argoapi/" + path.lstrip("/")).replace("//", "/")
 
         context = ssl._create_unverified_context()
-        conn = http.client.HTTPSConnection(TARGET_HOST, self.server.target_port, context=context, timeout=300)
+        conn = http.client.HTTPSConnection(self.server.target_host, self.server.target_port, context=context, timeout=300)
 
         # Build headers
         headers = {k: v for k, v in self.headers.items() if k.lower() not in ['host', 'content-length', 'authorization']}
@@ -119,10 +119,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 conn.close()
                 if attempt == 0 and self.server.recover_tunnel():
                     print(f"[{method}] Retrying after tunnel recovery...")
-                    conn = http.client.HTTPSConnection(TARGET_HOST, self.server.target_port, context=context, timeout=300)
+                    conn = http.client.HTTPSConnection(self.server.target_host, self.server.target_port, context=context, timeout=300)
                     continue
                 print(f"[{method}] Upstream connection refused (tunnel is down)")
-                self._send_error(502, "Bad Gateway: SSH tunnel is down. Restart argo_shim.")
+                self._send_error(502, "Bad Gateway: SSH tunnel is down. Restart argo-shim.")
                 return
             except Exception as e:
                 conn.close()
@@ -166,14 +166,20 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, server_address, handler, target_port, auth_token):
+    def __init__(self, server_address, handler, target_host, target_port, auth_token, tunnel_is_remote=False):
+        self.target_host = target_host
         self.target_port = target_port
         self.auth_token = auth_token
+        self.tunnel_is_remote = tunnel_is_remote
         self._tunnel_lock = threading.Lock()
         super().__init__(server_address, handler)
 
     def recover_tunnel(self):
         """Attempt to recreate the SSH tunnel. Returns True if recovery succeeded."""
+        if self.tunnel_is_remote:
+            # Remote tunnel (--tunnel-host / --relay): can't recreate from here
+            print("Tunnel is remote — cannot recover locally. Check the relay or UAN.")
+            return False
         with self._tunnel_lock:
             # Re-check under lock — another thread may have already recovered
             if find_existing_tunnel(self.target_port):
@@ -228,8 +234,10 @@ def verify_tunnel(port, host="127.0.0.1"):
 def is_own_process(port):
     """Check if the process listening on a port belongs to the current user."""
     try:
+        # Use TCP:{port} without address filter — lsof represents 0.0.0.0 as *
+        # so TCP@127.0.0.1 and TCP@0.0.0.0 both fail to match wildcard binds.
         result = subprocess.run(
-            ["lsof", "-ti", f"TCP@127.0.0.1:{port}", "-sTCP:LISTEN"],
+            ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
             capture_output=True, text=True, timeout=5
         )
         for pid in result.stdout.strip().split('\n'):
@@ -266,7 +274,7 @@ def find_existing_tunnel(port, host="127.0.0.1"):
     return False
 
 
-def create_tunnel(port, host="127.0.0.1"):
+def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
     """Create a new SSH tunnel on the given port and verify it's working."""
     check_port_available(port, host)
     cmd = [
@@ -274,7 +282,7 @@ def create_tunnel(port, host="127.0.0.1"):
         "-o", "ServerAliveInterval=15",
         "-o", "ServerAliveCountMax=4",
         "-J", f"{API_KEY}@{SSH_PROXY_JUMP}",
-        "-L", f"{port}:{REAL_HOST}:443",
+        "-L", f"{bind_address}:{port}:{REAL_HOST}:443",
         f"{API_KEY}@{SSH_JUMP_HOST}",
     ]
     print(f"Creating SSH tunnel on port {port}...")
@@ -302,6 +310,16 @@ def create_tunnel(port, host="127.0.0.1"):
     return port
 
 
+def create_reverse_tunnel(remote_host, port):
+    """Create a reverse SSH tunnel, forwarding remote_host:port to localhost:port."""
+    cmd = ["ssh", "-N", "-f", "-R", f"0.0.0.0:{port}:127.0.0.1:{port}", remote_host]
+    print(f"Creating reverse tunnel to {remote_host}:{port}...")
+    print(f"  $ {' '.join(cmd)}")
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        raise RuntimeError(f"Reverse SSH tunnel to {remote_host} failed (exit code {result.returncode})")
+
+
 def update_claude_settings(listen_port, auth_token):
     """Update ~/.claude/settings.json with the correct ANTHROPIC_BASE_URL and auth token."""
     settings_path = os.path.expanduser("~/.claude/settings.json")
@@ -325,7 +343,10 @@ def update_claude_settings(listen_port, auth_token):
         settings["apiKeyHelper"] = f"echo {auth_token}"
     else:
         settings["apiKeyHelper"] = "echo no-auth"
-    settings.setdefault("env", {})["ANTHROPIC_BASE_URL"] = new_url
+    env = settings.setdefault("env", {})
+    env["ANTHROPIC_BASE_URL"] = new_url
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        env[var] = ""
 
     with open(settings_path, "w") as f:
         json.dump(settings, f, indent=2)
@@ -335,16 +356,16 @@ def update_claude_settings(listen_port, auth_token):
     return True
 
 
-def health_check(tunnel_port, listen_port, auth_token):
+def health_check(tunnel_host, tunnel_port, listen_port, auth_token):
     """Validate the full chain: tunnel -> remote endpoint, and shim -> tunnel."""
     print("\nRunning health checks...")
     ok = True
 
     # 1. Tunnel health: TLS + HTTP request to the real endpoint
-    print(f"  [1/2] Tunnel (127.0.0.1:{tunnel_port} -> {REAL_HOST})...")
+    print(f"  [1/2] Tunnel ({tunnel_host}:{tunnel_port} -> {REAL_HOST})...")
     try:
         context = ssl._create_unverified_context()
-        conn = http.client.HTTPSConnection(TARGET_HOST, tunnel_port, context=context, timeout=10)
+        conn = http.client.HTTPSConnection(tunnel_host, tunnel_port, context=context, timeout=10)
         conn.request("GET", "/argoapi/v1/models", headers={"Host": REAL_HOST, "x-api-key": API_KEY})
         resp = conn.getresponse()
         body = resp.read()
@@ -388,14 +409,30 @@ def health_check(tunnel_port, listen_port, auth_token):
     return ok
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description="HTTP proxy shim for Argo API via SSH tunnel")
     parser.add_argument("--no-auth", action="store_true",
                         help="Disable token authentication on the shim (useful when project-level "
                              "Claude settings override the global apiKeyHelper)")
     parser.add_argument("--port", type=int, default=None,
                         help="Listen port for the shim (default: derived from username)")
+    parser.add_argument("--tunnel", action="store_true",
+                        help="Create an SSH tunnel bound to 0.0.0.0 (for compute node access) and exit. "
+                             "Requires SSH access to CELS. Run on a UAN, or use --relay from your Mac.")
+    parser.add_argument("--tunnel-host", default=None,
+                        help="Connect to an existing tunnel on a remote host (e.g., a UAN hostname). "
+                             "Skips local tunnel creation. Use when running from compute nodes.")
+    parser.add_argument("--relay", metavar="REMOTE_HOST", default=None,
+                        help="Relay mode: create SSH tunnel locally, then reverse-forward it to "
+                             "REMOTE_HOST (e.g., a UAN). Run this on your Mac so compute nodes "
+                             "can reach the API via the UAN.")
+    parser.add_argument("--no-update-settings", action="store_true",
+                        help="Don't modify ~/.claude/settings.json (useful if you manage settings separately)")
     args = parser.parse_args()
+
+    mode_flags = sum(bool(x) for x in [args.tunnel, args.tunnel_host, args.relay])
+    if mode_flags > 1:
+        parser.error("--tunnel, --tunnel-host, and --relay are mutually exclusive")
 
     print(f"API key: {API_KEY}")
 
@@ -405,12 +442,58 @@ if __name__ == "__main__":
         listen_port = default_port(API_KEY)
         print(f"Derived port {listen_port} from username (override with --port <PORT>)")
     tunnel_port = listen_port - 1
+    tunnel_host = args.tunnel_host or "127.0.0.1"
 
-    # 1. Look for an existing verified tunnel
-    if find_existing_tunnel(tunnel_port):
+    if args.tunnel:
+        # Tunnel-only mode: create a 0.0.0.0-bound tunnel on the UAN and exit
+        hostname = socket.gethostname()
+        if find_existing_tunnel(tunnel_port, "0.0.0.0") or find_existing_tunnel(tunnel_port):
+            print(f"Tunnel already running on port {tunnel_port}")
+        else:
+            create_tunnel(tunnel_port, bind_address="0.0.0.0")
+            print(f"Tunnel created on port {tunnel_port} (bound to 0.0.0.0)")
+        print(f"\nOn the compute node, run:")
+        print(f"  argo-shim --tunnel-host {hostname}")
+        return
+
+    if args.relay:
+        # Relay mode: create local tunnel, then reverse-forward to remote host
+        if find_existing_tunnel(tunnel_port):
+            print(f"Using existing tunnel on port {tunnel_port}")
+        else:
+            create_tunnel(tunnel_port)
+            print(f"Tunnel created on port {tunnel_port}")
+        create_reverse_tunnel(args.relay, tunnel_port)
+        print(f"\nRelay active: {args.relay}:{tunnel_port} -> localhost:{tunnel_port}")
+        print(f"\nOn the compute node, run:")
+        print(f"  argo-shim --tunnel-host {args.relay}")
+        # Continue to start the local shim so Mac can also use Claude
+
+    if args.tunnel_host:
+        # Compute node mode: use pre-existing tunnel on remote host
+        print(f"Using remote tunnel at {tunnel_host}:{tunnel_port}")
+        if not verify_tunnel(tunnel_port, tunnel_host):
+            # Direct connection failed (likely GatewayPorts disabled).
+            # Try SSH local forward to reach the remote host's localhost port.
+            print(f"  Direct connection failed, creating SSH forward to {tunnel_host}...")
+            fwd_cmd = ["ssh", "-N", "-f", "-L",
+                       f"127.0.0.1:{tunnel_port}:127.0.0.1:{tunnel_port}", tunnel_host]
+            print(f"  $ {' '.join(fwd_cmd)}")
+            result = subprocess.run(fwd_cmd)
+            if result.returncode != 0:
+                raise RuntimeError(f"SSH forward to {tunnel_host} failed (exit code {result.returncode})")
+            tunnel_host = "127.0.0.1"
+            if not verify_tunnel(tunnel_port, tunnel_host):
+                raise RuntimeError(
+                    f"No valid tunnel found at {args.tunnel_host}:{tunnel_port} "
+                    f"(tried direct and SSH forward). "
+                    f"Ensure --relay is running on your Mac."
+                )
+    elif args.relay:
+        pass  # tunnel already created above
+    elif find_existing_tunnel(tunnel_port):
         print(f"Using existing tunnel on port {tunnel_port}")
     else:
-        # 2. No valid tunnel found — create one
         create_tunnel(tunnel_port)
         print(f"Tunnel created on port {tunnel_port}")
 
@@ -422,10 +505,12 @@ if __name__ == "__main__":
         print("⚠ Auth disabled (--no-auth): shim accepts unauthenticated requests on localhost")
 
     # 4. Update Claude settings with the correct port and token
-    update_claude_settings(listen_port, auth_token)
-    print(f"Set ANTHROPIC_BASE_URL=http://127.0.0.1:{listen_port}/argoapi")
+    if not args.no_update_settings:
+        update_claude_settings(listen_port, auth_token)
+        print(f"Set ANTHROPIC_BASE_URL=http://127.0.0.1:{listen_port}/argoapi")
 
-    with ThreadedTCPServer(("127.0.0.1", listen_port), ProxyHandler, tunnel_port, auth_token) as httpd:
+    tunnel_is_remote = bool(args.tunnel_host)
+    with ThreadedTCPServer(("127.0.0.1", listen_port), ProxyHandler, tunnel_host, tunnel_port, auth_token, tunnel_is_remote) as httpd:
         print(f"✅ Shim running on {listen_port} -> {tunnel_port}. Supports GET/POST/HEAD.")
 
         def shutdown_handler(signum, frame):
@@ -437,7 +522,11 @@ if __name__ == "__main__":
         signal.signal(signal.SIGTERM, shutdown_handler)
 
         # 5. Run health checks in background after shim is listening
-        threading.Thread(target=health_check, args=(tunnel_port, listen_port, auth_token), daemon=True).start()
+        threading.Thread(target=health_check, args=(tunnel_host, tunnel_port, listen_port, auth_token), daemon=True).start()
 
         httpd.serve_forever()
         print("Shim stopped.")
+
+
+if __name__ == "__main__":
+    main()
