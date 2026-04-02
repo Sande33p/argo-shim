@@ -54,27 +54,27 @@ claude
 
 Compute nodes don't have outbound network access, so they can't create SSH tunnels directly. Instead, create the tunnel on a UAN and point the shim at it.
 
-**1. On a UAN** — create a tunnel bound to all interfaces:
+**1. On a UAN:**
 
 ```bash
-ssh -N -f -J $USER@logins.cels.anl.gov -L 0.0.0.0:25939:apps.inside.anl.gov:443 $USER@homes.cels.anl.gov
+argo-shim --tunnel
 ```
 
-(Replace `25939` with your tunnel port — it's `listen_port - 1`, where `listen_port` is what `argo-shim` prints as "Derived port".)
+This creates an SSH tunnel bound to all interfaces and prints the command to run on the compute node.
 
-**2. On the compute node** — run the shim with `--tunnel-host`:
+**2. On the compute node:**
 
 ```bash
 argo-shim --tunnel-host <uan-hostname>
 ```
 
-For example, if your tunnel is on `aurora-uan-0009`:
+Then start Claude Code:
 
 ```bash
-argo-shim --tunnel-host aurora-uan-0009
+claude
 ```
 
-The shim skips tunnel creation and proxies through the UAN's tunnel instead.
+The shim automatically clears proxy environment variables in `~/.claude/settings.json`, so no manual unsetting is needed.
 
 ## Claude Code Settings
 

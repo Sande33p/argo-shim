@@ -267,7 +267,7 @@ def find_existing_tunnel(port, host="127.0.0.1"):
     return False
 
 
-def create_tunnel(port, host="127.0.0.1"):
+def create_tunnel(port, host="127.0.0.1", bind_address="127.0.0.1"):
     """Create a new SSH tunnel on the given port and verify it's working."""
     check_port_available(port, host)
     cmd = [
@@ -275,7 +275,7 @@ def create_tunnel(port, host="127.0.0.1"):
         "-o", "ServerAliveInterval=15",
         "-o", "ServerAliveCountMax=4",
         "-J", f"{API_KEY}@{SSH_PROXY_JUMP}",
-        "-L", f"{port}:{REAL_HOST}:443",
+        "-L", f"{bind_address}:{port}:{REAL_HOST}:443",
         f"{API_KEY}@{SSH_JUMP_HOST}",
     ]
     print(f"Creating SSH tunnel on port {port}...")
@@ -326,7 +326,10 @@ def update_claude_settings(listen_port, auth_token):
         settings["apiKeyHelper"] = f"echo {auth_token}"
     else:
         settings["apiKeyHelper"] = "echo no-auth"
-    settings.setdefault("env", {})["ANTHROPIC_BASE_URL"] = new_url
+    env = settings.setdefault("env", {})
+    env["ANTHROPIC_BASE_URL"] = new_url
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        env[var] = ""
 
     with open(settings_path, "w") as f:
         json.dump(settings, f, indent=2)
@@ -396,6 +399,9 @@ def main():
                              "Claude settings override the global apiKeyHelper)")
     parser.add_argument("--port", type=int, default=None,
                         help="Listen port for the shim (default: derived from username)")
+    parser.add_argument("--tunnel", action="store_true",
+                        help="Create an SSH tunnel bound to 0.0.0.0 (for compute node access) and exit. "
+                             "Run this on a UAN before using --tunnel-host on a compute node.")
     parser.add_argument("--tunnel-host", default=None,
                         help="Connect to an existing tunnel on a remote host (e.g., a UAN hostname). "
                              "Skips local tunnel creation. Use when running from compute nodes.")
@@ -412,6 +418,18 @@ def main():
         print(f"Derived port {listen_port} from username (override with --port <PORT>)")
     tunnel_port = listen_port - 1
     tunnel_host = args.tunnel_host or "127.0.0.1"
+
+    if args.tunnel:
+        # Tunnel-only mode: create a 0.0.0.0-bound tunnel on the UAN and exit
+        hostname = socket.gethostname()
+        if find_existing_tunnel(tunnel_port):
+            print(f"Tunnel already running on port {tunnel_port}")
+        else:
+            create_tunnel(tunnel_port, bind_address="0.0.0.0")
+            print(f"Tunnel created on port {tunnel_port} (bound to 0.0.0.0)")
+        print(f"\nOn the compute node, run:")
+        print(f"  argo-shim --tunnel-host {hostname}")
+        return
 
     if args.tunnel_host:
         # Compute node mode: use pre-existing tunnel on remote host
