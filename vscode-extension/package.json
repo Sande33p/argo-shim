@@ -1,9 +1,13 @@
 {
   "name": "argo-shim-remote",
   "displayName": "Argo-Shim Remote Proxy",
-  "description": "An automated UI wrapper for the argo-shim Python CLI, simplifying secure SSH proxy connections for Claude Code on Argonne HPC environments.",
-  "version": "0.1.0",
+  "description": "Automatically deploys the argo-shim Python CLI as a secure HTTP proxy to the Argonne Claude API",
+  "version": "0.1.3",
   "publisher": "sandeepmadireddy",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sandeepmadireddy/argo-shim.git"
+  },
   "author": "Sandeep Madireddy",
   "engines": {
     "vscode": "^1.80.0"

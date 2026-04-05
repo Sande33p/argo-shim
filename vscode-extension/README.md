@@ -13,7 +13,7 @@ The very first time you boot the proxy, a native VS Code pop-up will ask you for
 When establishing secure remote proxy lines onto nodes like Aurora or Polaris, ALCF requires Duo Two-Factor Authentication. This plugin safely spawns a visible VS Code Terminal buffer prompting you exactly when to press `1` and authorize the SSH Push, preventing background timeouts. 
 
 ### 3. Integrated CLI Power Features
-By relying exclusively on the native `argo-shim` python CLI codebase asynchronously under the hood, this extension inherits crucial features that are difficult to handle inside bare IDEs: 
+By relying exclusively on the native `argo-shim` python CLI codebase asynchronously under the hood:
 * **Vertex AI 500-Error Deflection**: The baseline CLI forcefully intercepts any large, non-streaming Claude Code requests (often caused by large file loads) and patches them to `stream: true` to prevent hard 10-minute HTTP timeouts inside Google Vertex AI's infrastructure constraints. 
 * **Dynamic Deterministic Porting**: Uses SHA-256 to hash your Argonne CELS username to mathematically assign you a permanent, unique proxy port (e.g. `12499`). This absolutely prevents `Address already in use` clashes when multiple scientists have VS Code Server windows open on the exact same access node.
 * **Network Transparency**: Submits proxy interceptors that dynamically insert `localhost` and `127.0.0.1` into `no_proxy` environmental flags. This stops standard ALCF server firewalls from accidentally hijacking the IDE's connection loops!

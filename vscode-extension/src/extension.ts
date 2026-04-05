@@ -18,7 +18,7 @@ function getConfig() {
 
 export async function activate(context: vscode.ExtensionContext) {
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-    statusBarItem.command = 'argonne-claude.checkStatus';
+    statusBarItem.command = 'argonne-claude.startProxy';
     context.subscriptions.push(statusBarItem);
     statusBarItem.show();
     setStatus('warning', 'Initializing...');
@@ -112,9 +112,8 @@ async function fullBootstrap(silent = false) {
         term.show();
     }
 
-    // 2. Clear terminal and send command
-    term.sendText(`export CELS_USERNAME="${config.username}"`);
-    term.sendText('if command -v uvx &> /dev/null; then echo "Using uvx..."; uvx argo-shim; else echo "Using pip... this may take a moment"; pip install --upgrade --user argo-shim && export PATH=$PATH:~/.local/bin && argo-shim; fi');
+    // 2. Clear terminal and send command as a single atomic execution
+    term.sendText(`export CELS_USERNAME="${config.username}"; export ARGO_PORT=$(python3 -c "import hashlib, os; h=hashlib.sha256(os.environ['CELS_USERNAME'].encode()).hexdigest(); print(10000 + (int(h[:8], 16) % 22768))"); export TUN_PORT=$(($ARGO_PORT - 1)); rm -f ~/.ssh/.control_channels/*cels* 2>/dev/null; echo "🔐 Building Secure Tunnel via Bash (Approve Duo Push)..."; ssh -N -f -J $CELS_USERNAME@logins.cels.anl.gov -L $TUN_PORT:apps.inside.anl.gov:443 $CELS_USERNAME@homes.cels.anl.gov; if command -v uvx &> /dev/null; then echo "Booting argo-shim..."; uvx argo-shim --tunnel-host 127.0.0.1; else pip install --upgrade --user argo-shim && export PATH=$PATH:~/.local/bin && argo-shim --tunnel-host 127.0.0.1; fi`);
     
     if (!silent) {
         vscode.window.showInformationMessage(`🔐 Please check the '🟢 Argo Proxy' terminal to approve the Duo Push if prompted.`);
